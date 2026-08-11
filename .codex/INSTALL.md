@@ -26,11 +26,12 @@ cp -r spec/ ~/.agents/skills/sdrf-skills/spec/
 
 ## What it provides
 
-15 structured workflows (SKILL.md files) that encode expert-level SDRF annotation methodology:
+20 structured workflows (SKILL.md files) that encode expert-level SDRF annotation methodology:
 
 | Skill | Purpose |
 |-------|---------|
 | sdrf-setup | Install dependencies (parse_sdrf, techsdrf) — conda or pip setup |
+| sdrf-autoresearch | Autonomous retained-improvement loop over one dataset, a manifest, or a dataset class |
 | sdrf-knowledge | SDRF format rules, column names, ontology mappings |
 | sdrf-templates | Template system, layer selection, mutual exclusivity |
 | sdrf-annotate | Full annotation: PXD → PRIDE + paper → draft SDRF |
@@ -40,6 +41,8 @@ cp -r spec/ ~/.agents/skills/sdrf-skills/spec/
 | sdrf-terms | Ontology term lookup for any SDRF column |
 | sdrf-brainstorm | Pre-annotation metadata planning |
 | sdrf-review | Quality review with paper + PRIDE cross-reference |
+| sdrf-adversarial-review | Independent fresh-context falsification review with hash-bound approval |
+| sdrf-annotate-reviewed | Producer/reviewer annotation loop with mandatory re-review |
 | sdrf-explain | Plain-language SDRF education |
 | sdrf-convert | Pipeline selection (MaxQuant, DIA-NN, quantms) |
 | sdrf-design | Experimental design analysis |
@@ -52,6 +55,12 @@ Each SKILL.md file contains a complete workflow. Reference them from your Codex 
 
 ```text
 When annotating SDRF files, follow the workflow in skills/sdrf-annotate/SKILL.md
+```
+
+For autonomous loops, reference:
+
+```text
+Use the workflow in skills/sdrf-autoresearch/SKILL.md with target, profile, objective, evidence, stop, and write settings.
 ```
 
 ## Prerequisites

@@ -10,6 +10,11 @@ argument-hint: "[file path, PXD accession, or GitHub PR URL]"
 You are performing a comprehensive quality review of an SDRF file — like a peer reviewer
 would for a PRIDE submission or a community annotation PR.
 
+If this context created or edited the SDRF, this workflow is an advisory
+self-review only. For an approval verdict, dispatch a fresh context that follows
+`skills/sdrf-adversarial-review/SKILL.md`; never approve work produced in the
+same context.
+
 ## Step 1: Load Context
 
 1. **Read the SDRF** content
@@ -34,7 +39,12 @@ If a publication is available:
 - Are all conditions from the paper represented?
 - Do the instruments match?
 - Are demographics (age, sex) consistent with the paper?
+- Is `characteristics[developmental stage]` supported by the cohort description even if age is reported only at group level?
 - Are tissue types correctly annotated?
+
+When Europe PMC full text is available, do not inspect raw XML directly. First run:
+`python scripts/europepmc_fulltext.py PMC_ID --section methods --section results --section discussion --format text`
+or use `--format json` when structured links, captions, or accession detection will help the review.
 
 Flag any discrepancies:
 ```text
@@ -52,6 +62,7 @@ When SDRF and paper/PRIDE disagree:
 - **Instrument mismatch**: PRIDE might say "Q Exactive" while paper says "Q Exactive HF". The paper is usually more specific — update SDRF to match the paper's instrument model.
 - **Tissue specificity**: If paper says "hippocampus" but SDRF says "brain", update SDRF to the more specific term from the paper.
 - **Demographic mismatch**: If paper has a demographics table, prioritize it. SDRF might have been filled from incomplete metadata.
+- **Cohort-only demographics**: If the paper reports only cohort summaries, `developmental stage` may still be supportable, but do not force per-sample `age`, `sex`, or `ethnicity` without an individual-level mapping table.
 - **File count mismatch**: Some files in PRIDE may be non-raw (search results, FASTA, etc.). Compare only raw files.
 
 ## Step 4: Cross-Reference with PRIDE
@@ -61,9 +72,23 @@ If a PXD accession is available:
   ```text
   mcp PRIDE → get_project_files(project_accession="PXD######")
   ```
+  REST fallback:
+  ```text
+  GET https://www.ebi.ac.uk/pride/ws/archive/v3/projects/PXD######/files/all
+  ```
 - Does the organism match?
 - Does the instrument match?
 - Are all raw files accounted for?
+
+If PRIDE exposes no raw files and the dataset is hosted by MassIVE, use the
+deterministic helper:
+
+```bash
+python -m tools massive-files PXD016117 --mode raw --format tsv
+```
+
+Treat this as a fallback for reconstructing defensible `comment[data file]`
+values when the repository metadata is incomplete.
 
 ## Step 5: Design Analysis
 
@@ -127,4 +152,4 @@ Provide clear next steps:
 4. Suggest running final validation after fixes
 5. If the SDRF is for a ProteomeXchange dataset and the verdict is VALID or NEEDS MINOR FIXES:
    suggest contributing the annotation via `/sdrf:contribute {PXD}` to the
-   `proteomics-sample-metadata` community repository
+   `sdrf-annotated-datasets` community repository
