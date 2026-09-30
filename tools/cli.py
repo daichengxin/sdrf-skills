@@ -2,6 +2,7 @@
 
 Usage:
   python -m tools check <file.sdrf.tsv>          # hallucination check
+  python -m tools structure <file.sdrf.tsv>       # structural invariants
   python -m tools score <file.sdrf.tsv>           # quality scoring
   python -m tools fix <file.sdrf.tsv> [-o out]    # auto-fix
   python -m tools benchmark <PXD1> <file2> ...    # benchmark suite
@@ -10,6 +11,8 @@ Usage:
   python -m tools massive-files <PXD|MSV|task>     # MassIVE raw/acquisition file resolver
   python -m tools review-gate <command>             # independent-review receipt gate
   python -m tools audit-existing <file.sdrf.tsv>    # audit an already-annotated dataset
+  python -m tools bruker-dia <url|path>             # DIA windows from Bruker analysis.tdf
+  python -m tools search-params <path> [--json]     # extract search parameters from engine config
 """
 
 from __future__ import annotations
@@ -45,6 +48,58 @@ def cmd_check(args: argparse.Namespace) -> int:
     return 0 if report.is_clean else 1
 
 
+def cmd_structure(args: argparse.Namespace) -> int:
+    from tools.structure import check_structure
+    findings = check_structure(args.sdrf_file)
+    if not findings:
+        print("Structure OK: acquisition, template declaration and column order are consistent.")
+        return 0
+    print(f"{len(findings)} structural problem(s):")
+    for finding in findings:
+        print(f"  {finding}")
+    return 1
+
+
+def cmd_contract(args: argparse.Namespace) -> int:
+    from tools.contract import render_json, render_text, template_contract
+    try:
+        c = template_contract(args.templates, args.terms)
+    except ValueError as e:
+        print(f"error: {e}")
+        return 2
+    print(render_json(c) if args.json else render_text(c))
+    return 0
+
+
+def cmd_build(args: argparse.Namespace) -> int:
+    from tools.build import BuildError, build
+    try:
+        return build(args.samples, args.technical, args.files, args.templates, args.output)
+    except (BuildError, ValueError) as e:
+        print(f"build refused: {e}")
+        return 2
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Is everything the skills need installed? One line per dependency, exit 1 if the validator is missing."""
+    import importlib.util
+    import shutil
+
+    from tools.column_ontology_map import resolve_terms_tsv
+    rows = []
+    ok = shutil.which("parse_sdrf") is not None
+    rows.append((ok, "parse_sdrf (sdrf-pipelines)", "pip install 'sdrf-pipelines[ontology]'"))
+    rows.append((importlib.util.find_spec("sdrf_pipelines") is not None, "sdrf_pipelines importable by this interpreter",
+                 "install sdrf-pipelines into the interpreter that runs sdrf-tools"))
+    rows.append((shutil.which("sdrf-tools") is not None, "sdrf-tools on PATH", "pip install -e <sdrf-skills checkout>"))
+    rows.append((resolve_terms_tsv(args.terms) is not None, "spec TERMS.tsv", "git submodule update --init --recursive"))
+    rows.append((shutil.which("techsdrf") is not None, "techsdrf (optional: raw-file verification)",
+                 "pip install git+https://github.com/bigbio/techsdrf.git"))
+    for good, what, fix in rows:
+        print(f"  {'ok ' if good else 'MISSING'}  {what}" + ("" if good else f"  ->  {fix}"))
+    return 0 if rows[0][0] else 1
+
+
 def cmd_score(args: argparse.Namespace) -> int:
     from tools.completeness import score_sdrf
     report = score_sdrf(args.sdrf_file)
@@ -54,6 +109,7 @@ def cmd_score(args: argparse.Namespace) -> int:
 
 def cmd_fix(args: argparse.Namespace) -> int:
     from pathlib import Path
+
     from tools.sdrf_fixer import fix_sdrf
     fixed, report = fix_sdrf(args.sdrf_file)
     print(report.changelog())
@@ -118,8 +174,9 @@ def cmd_massive_files(args: argparse.Namespace) -> int:
 
 
 def cmd_cellline(args: argparse.Namespace) -> int:
-    from tools.cellline_db import CellLineDatabase, annotate_sdrf_celllines
     from pathlib import Path
+
+    from tools.cellline_db import CellLineDatabase, annotate_sdrf_celllines
 
     if args.cellline_command == "lookup":
         db = CellLineDatabase()
@@ -189,6 +246,85 @@ def cmd_audit_existing(args: argparse.Namespace) -> int:
     return 1 if report.blockers else 0
 
 
+def cmd_bruker_dia(args: argparse.Namespace) -> int:
+    """Read DIA isolation windows out of a Bruker .d archive without downloading it."""
+    import json
+
+    from tools.bruker_tdf import (
+        ZipRangeError,
+        analyze,
+        describe_isolation_window,
+        render,
+    )
+
+    try:
+        acq = analyze(args.source)
+    except ZipRangeError as exc:
+        print(f"error: {exc}")
+        return 2
+    if args.json:
+        print(json.dumps({
+            "source": acq.source,
+            "instrument": acq.properties.get("InstrumentName"),
+            "windows": [vars(w) for w in acq.windows],
+            "isolation_window": describe_isolation_window(acq),
+        }, indent=2))
+    else:
+        print(render(acq))
+    return 0
+
+
+def cmd_reconcile(args: argparse.Namespace) -> int:
+    """Reconcile an SDRF's values against the archive record they came from."""
+    import json
+    from pathlib import Path
+
+    from tools.record_reconcile import reconcile
+
+    record = json.loads(Path(args.record).read_text(encoding="utf-8-sig"))
+    # PRIDE's /projects/{acc} endpoint nests the fields under a "project" key; the search
+    # endpoint returns them flat. Accept either.
+    if "project" in record and isinstance(record["project"], dict):
+        record = record["project"]
+
+    text = Path(args.sdrf_file).read_text(encoding="utf-8-sig")
+    lines = text.splitlines()
+    if not lines:
+        print("empty SDRF")
+        return 1
+    header = [h.strip() for h in lines[0].split("\t")]
+    rows = []
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        cells = line.split("\t")
+        row: dict[str, str] = {}
+        for name, value in zip(header, cells):
+            # A repeated column (cleavage agent, modification parameters) must not be
+            # collapsed to its last value the way csv.DictReader would.
+            row[name] = value if name not in row else f"{row[name]}|{value}"
+        rows.append(row)
+
+    report = reconcile(record, rows, accession=args.accession or "")
+    print(report.render())
+    return 1 if report.blockers else 0
+
+
+def cmd_search_params(args: argparse.Namespace) -> int:
+    """Extract search parameters from a deposited search-engine config file."""
+    import sqlite3
+
+    from tools.search_params import extract, render_json, render_text
+
+    try:
+        params = extract(args.path)
+    except (OSError, ValueError, SyntaxError, sqlite3.DatabaseError) as e:  # SyntaxError: XML ParseError
+        print(f"error: {e}")
+        return 2
+    print(render_json(params) if args.json else render_text(params))
+    return 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="python -m tools",
@@ -201,6 +337,37 @@ def main() -> None:
     p.add_argument("sdrf_file")
     p.add_argument("--offline", action="store_true")
     p.add_argument("--spec", default=None)
+
+    # structure
+    p = subparsers.add_parser(
+        "structure", help="Check SDRF structural invariants (acquisition, templates, column order)"
+    )
+    p.add_argument("sdrf_file")
+
+    # contract
+    p = subparsers.add_parser(
+        "contract",
+        help="Print the column contract (order, requirement, value form, reserved words) for a template union",
+    )
+    p.add_argument("-t", "--template", dest="templates", action="append", required=True,
+                   help="Template name; repeat for a union (e.g. -t ms-proteomics -t human)")
+    p.add_argument("--terms", default=None, help="Path to TERMS.tsv (default: bundled spec)")
+    p.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    # build
+    p = subparsers.add_parser(
+        "build",
+        help="Expand samples.tsv + technical.tsv into a structurally valid SDRF (never guesses a channel map)",
+    )
+    p.add_argument("--samples", required=True, help="One row per source: source name, files, label, characteristics...")
+    p.add_argument("--technical", default=None, help="Two columns 'column','value'; '|' separates multiple values")
+    p.add_argument("--files", required=True, help="files.json: the raw file names in scope")
+    p.add_argument("-t", "--template", dest="templates", action="append", required=True)
+    p.add_argument("-o", "--output", required=True)
+
+    # doctor
+    p = subparsers.add_parser("doctor", help="Check that parse_sdrf, sdrf-tools, the spec and techsdrf are available")
+    p.add_argument("--terms", default=None, help="Path to TERMS.tsv (default: bundled spec)")
 
     # score
     p = subparsers.add_parser("score", help="Score SDRF quality (0-100)")
@@ -261,6 +428,16 @@ def main() -> None:
     )
     p.add_argument("review_gate_args", nargs=argparse.REMAINDER)
 
+    # reconcile
+    p = subparsers.add_parser(
+        "reconcile",
+        help="Check an SDRF's values against the deposit record's prose and run names",
+    )
+    p.add_argument("sdrf_file")
+    p.add_argument("--record", required=True,
+                   help="JSON project record from the archive (PRIDE /projects/{acc} or search)")
+    p.add_argument("--accession", default=None)
+
     # audit-existing
     p = subparsers.add_parser(
         "audit-existing",
@@ -273,6 +450,25 @@ def main() -> None:
     p.add_argument("--organism", action="append", default=None,
                    help="organism registered in PRIDE (repeatable); omitted = organism check skipped")
 
+    # bruker-dia
+    p = subparsers.add_parser(
+        "bruker-dia",
+        help="Read DIA isolation windows from a Bruker analysis.tdf (HTTP-range, no download)",
+    )
+    p.add_argument(
+        "source",
+        help="URL or path of a .d.zip archive, or a path to an extracted analysis.tdf",
+    )
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+
+    # search-params
+    p = subparsers.add_parser(
+        "search-params",
+        help="Extract search parameters from a deposited search-engine config file",
+    )
+    p.add_argument("path", help="File path: mqpar.xml, parameters.txt, fragger.params, .msf, or DIA-NN log")
+    p.add_argument("--json", action="store_true", help="Machine-readable output")
+
     args = parser.parse_args()
 
     # Set default db path for cellline commands
@@ -282,6 +478,10 @@ def main() -> None:
 
     commands = {
         "check": cmd_check,
+        "structure": cmd_structure,
+        "contract": cmd_contract,
+        "build": cmd_build,
+        "doctor": cmd_doctor,
         "score": cmd_score,
         "fix": cmd_fix,
         "benchmark": cmd_benchmark,
@@ -290,6 +490,9 @@ def main() -> None:
         "verify": cmd_verify,
         "review-gate": cmd_review_gate,
         "audit-existing": cmd_audit_existing,
+        "bruker-dia": cmd_bruker_dia,
+        "reconcile": cmd_reconcile,
+        "search-params": cmd_search_params,
     }
 
     sys.exit(commands[args.command](args))

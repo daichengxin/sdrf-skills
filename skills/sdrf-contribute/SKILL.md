@@ -1,11 +1,17 @@
 ---
-name: sdrf:contribute
+name: sdrf-contribute
 description: Use when the user has a completed SDRF annotation for a ProteomeXchange dataset and wants to contribute it back to the community via a PR to sdrf-annotated-datasets.
 user-invocable: true
 argument-hint: "[PXD accession and SDRF file path]"
 ---
 
 # SDRF Contribution Workflow
+
+> **Bundle paths.** `spec/`, `tools/` and `data/` ship with this skill, not with your working
+> directory. Resolve every such path below against the bundle root — `$CLAUDE_PLUGIN_ROOT` under
+> Claude Code (`$CLAUDE_PLUGIN_ROOT/spec/sdrf-proteomics/TERMS.tsv`), or your sdrf-skills checkout
+> on other platforms. The helpers are the `sdrf-tools` command, installed by ``sdrf-tools doctor` (install notes: `sdrf-annotate/references/setup.md`)`; no `PYTHONPATH` or plugin-root variable is needed to run them.
+> Files the user is annotating stay relative to the working directory.
 
 You are helping the user contribute an annotated SDRF file back to the community repository
 (`bigbio/sdrf-annotated-datasets`). This is the final step after annotation, validation,
@@ -19,7 +25,7 @@ and review — closing the loop from "I annotated a dataset" to "the community c
 
 ### 1.2 Verify the SDRF content
 - The SDRF must be available as a file on disk or from a previous annotation step
-- If the user just finished `/sdrf:annotate`, the content is in the conversation
+- If the user just finished `/sdrf-skills:sdrf-annotate`, the content is in the conversation
 - Ask the user to confirm the file path or provide the content
 
 ### 1.3 Check if this is a new annotation or an update
@@ -62,7 +68,7 @@ url=$(gh api "repos/bigbio/sdrf-annotated-datasets/contents/datasets/{PXD}/{FILE
 curl -fsSL "$url" -o existing.sdrf.tsv
 [ -s existing.sdrf.tsv ] || { echo "empty download — abort"; exit 1; }
 
-python -m tools audit-existing existing.sdrf.tsv --accession {PXD} \
+sdrf-tools audit-existing existing.sdrf.tsv --accession {PXD} \
   --runs deposited_runs.txt --organism "<each organism PRIDE registers>"
 ```
 
@@ -76,7 +82,7 @@ Then:
   each defect, the evidence from the deposit, and what the new file does instead.
   A reviewer must be able to check the claim rather than trust it.
 
-If `/sdrf:annotate` already ran its Step 0.5 gate for this accession, reuse that
+If `/sdrf-skills:sdrf-annotate` already ran its Step 0.5 gate for this accession, reuse that
 audit instead of repeating it, and confirm the user chose `fix` or `reannotate`.
 **Never open a PR that silently overwrites an existing annotation.**
 
@@ -84,13 +90,17 @@ audit instead of repeating it, and confirm the user chose `fix` or `reannotate`.
 
 Before contributing, the SDRF must pass validation:
 
-1. **Suggest programmatic validation**:
+1. **Suggest programmatic validation** — run once per declared `comment[sdrf template]`, each against the rows that declare it; every run must pass:
    ```bash
    pip install sdrf-pipelines
-   parse_sdrf validate-sdrf --sdrf_file {PXD}.sdrf.tsv
+   parse_sdrf validate-sdrf --sdrf_file datasets/{PXD}/{PXD}.sdrf.tsv --template ms-proteomics
+   # repeat --template <organism/experiment template> for each declared template
    ```
+   The target repo's CI **SDRF review gate** also checks coordinate collisions and ragged rows on every changed file — reproduce those locally before pushing.
 
-2. **Run `/sdrf:validate`** for a thorough check including ontology verification
+   **Zero-deletion guard (mandatory before PR):** stage only your new folder (`git add datasets/{PXD}/`, never `git add -A`), then run `git diff --cached --name-status` and confirm every line is `A` — abort if any `D`/`M`/`R` touches a dataset you did not create.
+
+2. **Run ``/sdrf-skills:sdrf-annotate <file.sdrf.tsv>` (review mode)`** for a thorough check including ontology verification
 
 3. **Require independent adversarial approval**:
    ```bash
@@ -129,10 +139,12 @@ datasets/
 ```
 
 ### 3.2 Save the file
-Save the SDRF content to the correct path:
+Save the SDRF content to the correct path (note the top-level `datasets/`):
 ```text
-{PXD}/{PXD}.sdrf.tsv
+datasets/{PXD}/{PXD}.sdrf.tsv
 ```
+If the SDRF still has unverifiable sample->file/channel maps or demographics, put it under
+`sandbox/{PXD}/` instead (CI-exempt) with a `BLOCKED:` note — never PR unresolved data to `datasets/`.
 
 Ensure the file:
 - Uses tab delimiters (not spaces or commas)
@@ -184,11 +196,11 @@ gh pr create \
 **Factor values**: {factor_description}
 
 ### Validation
-- [x] Validated with `sdrf-pipelines validate-sdrf`
-- [x] Ontology terms verified via OLS
+- [ ] Validated with `parse_sdrf validate-sdrf` (per declared template)
+- [ ] Ontology terms verified via OLS
+- [ ] Coordinate rows unique; no ragged rows
 
-### Annotation source
-Annotated using [sdrf-skills](https://github.com/bigbio/sdrf-skills).
+_Tick each box only after it actually passes._
 EOF
 )"
 ```
@@ -238,7 +250,7 @@ After the PR is created:
 
 - NEVER create a PR without user confirmation
 - NEVER skip validation before contributing
-- NEVER modify the SDRF content during the contribution step (that's what `/sdrf:fix` and `/sdrf:improve` are for)
+- NEVER modify the SDRF content during the contribution step (that's what ``sdrf-tools fix` (patterns: `sdrf-annotate/references/fix-patterns.md`)` and `/sdrf-skills:sdrf-annotate <file.sdrf.tsv> (review mode)` are for)
 - If the user doesn't have `gh` CLI installed, always fall back to Mode B (guided commands)
 - If the user doesn't have a GitHub account, explain that one is needed and point to https://github.com/signup
 - For non-PXD accessions (MSV, PMID), the same workflow applies — just use the accession as the folder name

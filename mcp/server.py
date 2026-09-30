@@ -14,6 +14,7 @@ import re
 import threading
 import urllib.parse
 import xml.etree.ElementTree as ET
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -319,26 +320,13 @@ def search_projects(
     results: list[dict] = []
     errors: list[str] = []
 
-    def _names(rec: dict, key: str) -> list[str]:
-        # /search/projects returns plain strings where /projects/{acc} returns
-        # CvParam dicts for the same logical field. Accept both.
-        out = []
-        for v in rec.get(key, []) or []:
-            out.append(v.get("name", "") if isinstance(v, dict) else str(v))
-        return out
+    _names = _pride_names
 
     if repo in {"all", "pride"}:
-        data = _cached_get_json(
-            f"{PRIDE_BASE}/search/projects",
-            params={"keyword": keyword, "pageSize": str(page_size), "page": str(page)},
-        )
-        if data is None:
+        items = _pride_search_page(keyword, page, page_size)
+        if items is None:
             errors.append("PRIDE search unreachable")
             items = []
-        else:
-            items = data if isinstance(data, list) else (
-                data.get("_embedded", {}).get("compactprojects", []) or []
-            )
         for it in items:
             results.append(_pride_search_hit(it, _names))
 
@@ -377,6 +365,242 @@ def search_projects(
         "count": len(results),
         "results": results,
     }
+    if errors:
+        out["errors"] = errors
+    return out
+
+
+def _pride_names(rec: dict, key: str) -> list[str]:
+    """/search/projects returns plain strings where /projects/{acc} returns CvParam dicts."""
+    out = []
+    for v in rec.get(key, []) or []:
+        out.append(v.get("name", "") if isinstance(v, dict) else str(v))
+    return out
+
+
+def _pride_search_page(
+    keyword: str, page: int, page_size: int, year: int | None = None
+) -> list | None:
+    """One page of PRIDE /search/projects. None means the request failed."""
+    params = {"keyword": keyword, "pageSize": str(page_size), "page": str(page)}
+    if year is not None:
+        # field==value is the documented filter grammar (pridepy --filters).
+        params["filter"] = f"submissionDate=={year}"
+    data = _cached_get_json(f"{PRIDE_BASE}/search/projects", params=params)
+    if data is None:
+        return None
+    if isinstance(data, list):
+        return data
+    return data.get("_embedded", {}).get("compactprojects", []) or []
+
+
+# A keyword search that ends on a page boundary is ambiguous: the result set may
+# be exhausted, or the endpoint may be refusing to serve past a cap. PRIDE has
+# historically done the latter (a bare keyword capped at 100 while reporting an
+# empty next page — indistinguishable from exhaustion, see #28). It paginates
+# correctly today, so this is not worked around unconditionally; it is DETECTED,
+# and the year-partitioned retry runs only when detection fires.
+_PRIDE_MAX_PAGES = 200
+_PRIDE_FIRST_YEAR = 2004
+
+
+def _pride_walk(
+    keyword: str,
+    page_size: int,
+    year: int | None = None,
+    max_results: int = 10000,
+) -> tuple[list[dict], str]:
+    """Page one PRIDE query to exhaustion.
+
+    Returns (hits, status) where status is one of:
+      exhausted      — a short page ended it; the result set is complete
+      suspected_cap  — the last full page was followed by an empty one, so
+                       "complete" cannot be distinguished from "truncated"
+      page_error     — a page request failed; the result set is INCOMPLETE
+      max_results    — the caller's ceiling stopped the walk
+    """
+    hits: list[dict] = []
+    for page in range(_PRIDE_MAX_PAGES):
+        items = _pride_search_page(keyword, page, page_size, year)
+        if items is None:
+            return hits, "page_error"
+        if not items:
+            # An empty FIRST page is a genuinely empty result set. An empty page
+            # after a full one is the ambiguous case: exhaustion and a refusal to
+            # serve past a cap look identical from here.
+            return hits, "suspected_cap" if hits else "exhausted"
+        hits.extend(items)
+        if len(items) < page_size:
+            return hits, "exhausted"
+        if len(hits) >= max_results:
+            return hits, "max_results"
+    return hits, "suspected_cap"
+
+
+def _pride_walk_partitioned(
+    keyword: str, page_size: int, max_results: int, until_year: int
+) -> tuple[list[dict], list[str]]:
+    """Re-run a capped keyword one submission year at a time.
+
+    A filter makes the endpoint paginate past the cap even when a bare keyword
+    will not, so partitioning recovers what the plain walk could not reach.
+    """
+    hits: list[dict] = []
+    still_capped: list[str] = []
+    for year in range(until_year, _PRIDE_FIRST_YEAR - 1, -1):
+        part, status = _pride_walk(keyword, page_size, year=year,
+                                   max_results=max_results - len(hits))
+        hits.extend(part)
+        if status in ("suspected_cap", "page_error", "max_results"):
+            still_capped.append(f"{keyword}@{year}:{status}")
+        if len(hits) >= max_results:
+            break
+    return hits, still_capped
+
+
+def _massive_walk(keyword: str, page_size: int, max_results: int) -> tuple[list[dict], str]:
+    """Page MassIVE PROXI to exhaustion. pageNumber is 1-based; 404 = exhausted."""
+    hits: list[dict] = []
+    for page in range(_PRIDE_MAX_PAGES):
+        data = _cached_get_json(
+            f"{MASSIVE_BASE}/datasets",
+            params={
+                "resultType": "full",
+                "search": keyword,
+                "pageSize": str(page_size),
+                "pageNumber": str(page + 1),
+            },
+            not_found_ok=True,
+        )
+        if data is None:
+            return hits, "page_error"
+        items = data if isinstance(data, list) else []
+        hits.extend(items)
+        if len(items) < page_size:
+            return hits, "exhausted"
+        if len(hits) >= max_results:
+            return hits, "max_results"
+    return hits, "suspected_cap"
+
+
+# --- 1.0b Multi-keyword exhaustive discovery ---
+@mcp.tool()
+def search_extensive(
+    keywords: list[str] | str,
+    repository: str = "all",
+    page_size: int = 100,
+    max_results: int = 5000,
+) -> dict:
+    """
+    Discover datasets across PRIDE + MassIVE by sweeping SEVERAL keywords and
+    unioning the results. Use this, not repeated search_projects calls, whenever
+    the target is a whole category ("all single-cell proteomics datasets") and
+    completeness matters.
+
+    Two measured facts drive this tool:
+
+    1. **One keyword under-recalls.** PRIDE ANDs the terms in a keyword and then
+       RANKS rather than filters, so a category sentence collapses recall
+       ("metaproteomics" 100+, "human gut metaproteomics" 2) and no single term
+       covers a field: a 16-keyword single-cell sweep (SCoPE2, nanoPOTS, plexDIA,
+       CellenONE, proteoCHIP, …) unions to more datasets than "single-cell
+       proteomics" returns on its own. Pass the sweep, not the sentence.
+    2. **Truncation must never be silent.** Each keyword is paged to a SHORT page,
+       which is the only unambiguous end-of-results signal. If a full page is
+       followed by an empty one — historically how PRIDE served a capped query —
+       the walk is retried partitioned by submission year, and anything still
+       unresolved is reported in `truncated` rather than passed off as complete.
+
+    `keywords` accepts a list or a single string. `repository`: "all" (default),
+    "pride", or "massive". `max_results` caps the union (reported when it bites).
+
+    Returns {keywords, repository, count, results:[<same hit shape as
+    search_projects>], per_keyword:{kw:{hits, new, status}}, truncated:[...],
+    errors:[...], requests_note}.
+    """
+    repo = (repository or "all").lower().strip()
+    if repo not in {"all", "pride", "massive"}:
+        return {"keywords": keywords, "count": 0, "results": [],
+                "error": f"repository must be all|pride|massive, got {repository!r}"}
+
+    if isinstance(keywords, str):
+        kws = [keywords]
+    else:
+        kws = list(keywords or [])
+    kws = [k.strip() for k in kws if k and k.strip()]
+    if not kws:
+        return {"keywords": [], "count": 0, "results": [],
+                "error": "keywords must contain at least one non-empty term"}
+
+    until_year = date.today().year
+    results: list[dict] = []
+    seen: set[str] = set()
+    per_keyword: dict[str, dict] = {}
+    truncated: list[str] = []
+    errors: list[str] = []
+
+    def _add(hit: dict) -> bool:
+        accs = [a for a in hit["all_accessions"] if a]
+        if any(a in seen for a in accs):
+            return False
+        results.append(hit)
+        seen.update(accs)
+        return True
+
+    for kw in kws:
+        stats = {"hits": 0, "new": 0, "status": "exhausted"}
+
+        if repo in {"all", "pride"}:
+            raw, status = _pride_walk(kw, page_size, max_results=max_results)
+            if status == "suspected_cap":
+                extra, still = _pride_walk_partitioned(
+                    kw, page_size, max_results, until_year)
+                raw = raw + extra
+                status = "partitioned" if not still else "truncated"
+                truncated.extend(still)
+            if status == "page_error":
+                errors.append(
+                    f"PRIDE search for {kw!r} lost a page — results are INCOMPLETE, retry")
+            if status == "max_results":
+                truncated.append(f"{kw}:max_results")
+            stats["status"] = status
+            for it in raw:
+                stats["hits"] += 1
+                if _add(_pride_search_hit(it, _pride_names)):
+                    stats["new"] += 1
+
+        if repo in {"all", "massive"}:
+            mraw, mstatus = _massive_walk(kw, page_size, max_results)
+            if mstatus == "page_error":
+                errors.append(
+                    f"MassIVE search for {kw!r} lost a page — results are INCOMPLETE, retry")
+            elif mstatus in ("suspected_cap", "max_results"):
+                truncated.append(f"{kw}@massive:{mstatus}")
+            stats["status"] = f"{stats['status']}/{mstatus}" if repo == "all" else mstatus
+            for rec in mraw:
+                stats["hits"] += 1
+                if _add(_massive_search_hit(rec)):
+                    stats["new"] += 1
+
+        per_keyword[kw] = stats
+
+    out = {
+        "keywords": kws,
+        "repository": repo,
+        "count": len(results),
+        "results": results,
+        "per_keyword": per_keyword,
+        "requests_note": (
+            "per_keyword.new is what each keyword contributed that no earlier "
+            "keyword had; a keyword with new=0 is redundant for this sweep"
+        ),
+    }
+    if truncated:
+        out["truncated"] = truncated
+        out["warning"] = (
+            "Coverage is NOT complete for the entries in `truncated` — report "
+            "them rather than presenting this union as the full result set."
+        )
     if errors:
         out["errors"] = errors
     return out
@@ -877,13 +1101,37 @@ def _unpaywall_result(
     return rec
 
 
+def _pick_oa_location(uw: dict) -> tuple[dict, str | None, int]:
+    """Choose the OA location to download from an Unpaywall record.
+
+    `best_oa_location` regularly has `url_for_pdf: null` (a publisher landing
+    page) while a repository copy in `oa_locations[]` does expose a direct PDF,
+    so falling back through the list is the difference between reporting a paper
+    as unreachable and fetching it. Unpaywall already orders `oa_locations`
+    best-first, so the first entry with a PDF is the preferred one.
+
+    Returns (location, pdf_url, n_oa_locations); `location` is the one the URL
+    came from, so license/host_type describe what is actually downloaded.
+    """
+    best = uw.get("best_oa_location") or {}
+    locations = [loc for loc in (uw.get("oa_locations") or []) if isinstance(loc, dict)]
+    if best.get("url_for_pdf"):
+        return best, best["url_for_pdf"], len(locations)
+    for loc in locations:
+        if loc.get("url_for_pdf"):
+            return loc, loc["url_for_pdf"], len(locations)
+    return best, None, len(locations)
+
+
 # --- 1.3f Get PDF via Unpaywall 并下载到本地 ---
 @mcp.tool()
 def get_pdf_by_unpaywall(identifiers: list[str], output_dir: str | None = None) -> list[dict]:
     """
     Find OA PDF via Unpaywall and download to local. Accepts DOI, PMID, doi_url, or pubmed_url.
-    For PMID: resolves to DOI via Europe PMC first. When Unpaywall has no pdf_url, falls back
-    to Europe PMC PDF. Downloaded files are validated against the PDF magic bytes; non-PDF
+    For PMID: resolves to DOI via Europe PMC first. The PDF URL comes from best_oa_location,
+    then from the first oa_locations[] entry exposing url_for_pdf (a repository copy often does
+    when the publisher landing page does not); the returned license/host_type describe the
+    location actually used. Falls back to the Europe PMC PDF last. Downloaded files are validated against the PDF magic bytes; non-PDF
     responses (e.g. publisher anti-bot HTML) are rejected.
     Download is streamed with a size cap (env SDRF_MCP_MAX_DOWNLOAD_MB, default 500 MB).
 
@@ -933,9 +1181,9 @@ def get_pdf_by_unpaywall(identifiers: list[str], output_dir: str | None = None) 
         license_val = None
         host_type = None
         uw = _cached_get_json(f"{UNPAYWALL_BASE}/{doi}", params={"email": email})
+        n_oa_locations = 0
         if uw:
-            best = uw.get("best_oa_location") or {}
-            pdf_url = best.get("url_for_pdf")
+            best, pdf_url, n_oa_locations = _pick_oa_location(uw)
             oa_status = uw.get("oa_status") or "closed"
             license_val = best.get("license")
             host_type = best.get("host_type")
@@ -947,10 +1195,18 @@ def get_pdf_by_unpaywall(identifiers: list[str], output_dir: str | None = None) 
                 pdf_url = _extract_pdf_url(hit)
 
         if not pdf_url:
+            # Distinguish "not openly available" from "open access, but no direct
+            # PDF link" -- they mean very different things to a caller deciding
+            # whether a source is reachable.
+            if n_oa_locations:
+                detail = (f"{n_oa_locations} Unpaywall OA location(s) exist but none "
+                          f"exposed a direct PDF link, and Europe PMC had none")
+            else:
+                detail = "no Unpaywall OA location and no Europe PMC PDF"
             results.append(_unpaywall_result(
                 raw, doi=doi, pmid=pmid,
                 oa_status=oa_status, license_val=license_val, host_type=host_type,
-                error="No PDF URL found (Unpaywall and Europe PMC)"))
+                error=f"No PDF URL found ({detail})"))
             continue
 
         # Stream-download and verify PDF magic bytes

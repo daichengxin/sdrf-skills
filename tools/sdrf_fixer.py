@@ -13,7 +13,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from tools.column_ontology_map import UNIMOD_KNOWN, UNIMOD_SWAPS, WRONG_RESERVED
+from tools.column_ontology_map import (
+    UNIMOD_BY_NAME,
+    UNIMOD_KNOWN,
+    UNIMOD_SWAPS,
+    WRONG_RESERVED,
+    get_ontologies_for_column,
+)
+
+RESERVED_SENTINELS = {"not available", "not applicable"}
 from tools.sdrf_parser import SDRFFile, parse_sdrf, parse_modification
 
 
@@ -102,6 +110,75 @@ _DDA_DIA_FIXES = {
 }
 
 
+_KV_LIST_RE = re.compile(r"(\b[A-Za-z]{2,3})=\[([^\]]*)\]")
+_ACC_UNDERSCORE_RE = re.compile(r"(AC=)([A-Za-z]+)_([0-9]+)")
+_BARE_ACC_RE = re.compile(r"(AC=)(\d+)(?=;|$)")
+
+
+def _fix_kv_python_artifact(value: str) -> tuple[str | None, str]:
+    """Strip Python list syntax from inside a key=value cell, e.g. TA=['C'] -> TA=C.
+
+    _fix_python_artifacts only matches a cell that is entirely a Python literal, so an
+    artifact embedded in a key=value string (the common case for TA=/PP=) slips past it.
+    """
+    if "=[" not in value:
+        return None, ""
+
+    def repl(m: re.Match) -> str:
+        items = re.findall(r"[^,'\"\s]+", m.group(2))
+        return f"{m.group(1)}={','.join(items)}" if items else m.group(0)
+
+    fixed = _KV_LIST_RE.sub(repl, value)
+    if fixed != value:
+        return fixed, "Stripped Python list syntax from a key=value field"
+    return None, ""
+
+
+def _fix_quoted_cell(value: str) -> tuple[str | None, str]:
+    """Unwrap a cell that a CSV writer quoted, e.g. \"NT=Trypsin;AC=MS:1001251\"."""
+    v = value.strip()
+    if len(v) > 1 and v[0] == v[-1] and v[0] in "\"'" and "=" in v:
+        return v[1:-1], "Removed the quote characters a CSV writer left around the value"
+    return None, ""
+
+
+def _fix_accession_separator(value: str) -> tuple[str | None, str]:
+    """An accession separates prefix and id with a colon: PRIDE_0000568 -> PRIDE:0000568."""
+    fixed = _ACC_UNDERSCORE_RE.sub(r"\1\2:\3", value)
+    if fixed != value:
+        return fixed, "Accession uses ':' between prefix and id, not '_'"
+    return None, ""
+
+
+def _fix_sentinel_kv(value: str) -> tuple[str | None, str]:
+    """A reserved word is written bare, never wrapped: NT=not applicable;AC=not available."""
+    kv = {}
+    for part in value.split(";"):
+        if "=" not in part:
+            return None, ""
+        k, v = part.split("=", 1)
+        kv[k.strip().upper()] = v.strip()
+    if set(kv) == {"NT", "AC"} and kv["NT"].lower() in RESERVED_SENTINELS \
+       and kv["AC"].lower() in RESERVED_SENTINELS:
+        return kv["NT"].lower(), "Reserved word must be written bare, not wrapped in NT=/AC="
+    return None, ""
+
+
+def _fix_bare_accession(value: str, inner_name: str) -> tuple[str | None, str]:
+    """Restore the ontology prefix on a bare numeric accession: AC=1001251 -> AC=MS:1001251.
+
+    The prefix comes from the column's expected ontology, so it is only applied when the
+    column maps to exactly one ontology; an ambiguous column is left alone.
+    """
+    onts = get_ontologies_for_column(inner_name)
+    if len(onts) != 1:
+        return None, ""
+    fixed = _BARE_ACC_RE.sub(lambda m: f"{m.group(1)}{onts[0]}:{m.group(2)}", value)
+    if fixed != value:
+        return fixed, f"Restored the {onts[0]} prefix on a bare accession"
+    return None, ""
+
+
 def _fix_unimod_swap(mod_str: str) -> tuple[str | None, str]:
     """Fix UNIMOD accession swaps. Returns (fixed_str, reason) or (None, "")."""
     mod = parse_modification(mod_str)
@@ -120,6 +197,15 @@ def _fix_unimod_swap(mod_str: str) -> tuple[str | None, str]:
     # Check accession is known but name doesn't match
     known = UNIMOD_KNOWN.get(mod.ac.upper())
     if known and known.lower() != mod.nt.strip().lower():
+        # Prefer correcting the accession when the name is itself a known UNIMOD
+        # label: NT=Propionamide;AC=UNIMOD:374 is a mistyped accession
+        # (UNIMOD:24), not a request to relabel the mod as Dehydro.
+        by_name = UNIMOD_BY_NAME.get(mod.nt.strip().lower())
+        if by_name:
+            fixed = mod_str.replace(f"AC={mod.ac}", f"AC={by_name}")
+            reason = (f"{mod.ac} is {known}, not {mod.nt}. "
+                      f"Correct accession is {by_name}")
+            return fixed, reason
         fixed = mod_str.replace(f"NT={mod.nt}", f"NT={known}")
         reason = f"{mod.ac} = {known}, not {mod.nt}"
         return fixed, reason
@@ -204,6 +290,27 @@ def _fix_dda_dia(value: str) -> tuple[str | None, str]:
     return None, ""
 
 
+def _fix_characteristics_bare_label(value: str) -> tuple[str | None, str]:
+    """Sample-metadata (characteristics) ontology values are written as the bare OLS label.
+
+    Convert a pure ``NT=<label>;AC=<accession>`` pair to just ``<label>`` (e.g.
+    ``NT=Homo sapiens;AC=NCBITaxon:9606`` -> ``Homo sapiens``). Only applied to
+    ``characteristics[...]`` columns; ``comment[...]`` values keep the NT=;AC= form.
+    Structured characteristics that carry qualifier keys (spiked compound CT=/QY=,
+    pooled sample SN=, etc.) are left untouched, since they are not a plain NT/AC pair.
+    """
+    parts = [p for p in value.split(";") if p.strip()]
+    kv: dict[str, str] = {}
+    for p in parts:
+        if "=" not in p:
+            return None, ""  # already a bare label (or free text) -> leave it
+        k, v = p.split("=", 1)
+        kv[k.strip().upper()] = v.strip()
+    if set(kv) != {"NT", "AC"} or not kv.get("NT"):
+        return None, ""  # structured value (extra keys) -> keep as-is
+    return kv["NT"], "characteristics value written as the bare ontology label (dropped NT=;AC=)"
+
+
 def _fix_whitespace(value: str) -> tuple[str | None, str]:
     """Fix trailing/leading whitespace."""
     stripped = value.strip()
@@ -248,6 +355,12 @@ def fix_sdrf(source: str | Path) -> tuple[str, FixReport]:
             # Apply fixes in priority order
             fixers = []
 
+            # Pattern 0: characteristics ontology values -> bare OLS label.
+            # Sample metadata uses the plain label; comment columns keep NT=;AC=.
+            # Runs first so later fixes (e.g. case) act on the resulting label.
+            if col.raw_name.strip().lower().startswith("characteristics["):
+                fixers.append(("characteristics_bare_label", _fix_characteristics_bare_label))
+
             # Pattern 1: UNIMOD swaps (modification parameters)
             if inner == "modification parameters":
                 fixers.append(("unimod_swap", _fix_unimod_swap))
@@ -259,11 +372,20 @@ def fix_sdrf(source: str | Path) -> tuple[str, FixReport]:
             # Pattern 4: Python artifacts (all columns)
             fixers.append(("python_artifact", _fix_python_artifacts))
 
+            # Writer artifacts seen across the public corpus: a CSV writer's quotes, a
+            # Python list left inside a key=value field, an accession joined with '_',
+            # a reserved word wrapped in NT=/AC=, and a bare numeric accession.
+            fixers.append(("quoted_cell", _fix_quoted_cell))
+            fixers.append(("kv_python_artifact", _fix_kv_python_artifact))
+            fixers.append(("accession_separator", _fix_accession_separator))
+            fixers.append(("sentinel_kv", _fix_sentinel_kv))
+            fixers.append(("bare_accession", lambda v, i=inner: _fix_bare_accession(v, i)))
+
             # Pattern 5: Reserved words (all columns)
             fixers.append(("reserved_word", _fix_reserved_words))
 
             # Pattern 6: DDA/DIA terminology
-            if inner in ("dissociation method",) or "acquisition" in inner:
+            if inner == "proteomics data acquisition method":
                 fixers.append(("dda_dia", _fix_dda_dia))
 
             # Pattern 7: Age format
@@ -292,7 +414,20 @@ def fix_sdrf(source: str | Path) -> tuple[str, FixReport]:
     for col in sdrf.columns:
         col_key = sdrf.key_for_column(col.index)
         stripped = col.raw_name.strip()
-        if stripped != col.raw_name:
+        # pandas renames legitimately repeated columns (comment[modification parameters].1).
+        # The suffix makes each copy a different column, so readers see only the first.
+        de_suffixed = re.sub(r"(\])\.\d+$", r"\1", stripped)
+        if de_suffixed != stripped:
+            report.fixes.append(FixRecord(
+                row="header",
+                column=col.raw_name,
+                old_value=stripped,
+                new_value=de_suffixed,
+                reason="Removed the pandas duplicate-column suffix; repeated columns are legal in SDRF",
+                pattern="pandas_header_suffix",
+            ))
+            stripped = de_suffixed
+        if col.raw_name.strip() != col.raw_name:
             report.fixes.append(FixRecord(
                 row="header",
                 column=col.raw_name,

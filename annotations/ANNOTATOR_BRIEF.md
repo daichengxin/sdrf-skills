@@ -50,8 +50,16 @@ mkdir -p "$CLAUDE_SCRATCH/<PXD>/"      # or <repo>/../scratch/<PXD>/ if no scrat
   - Bruker `.d`: `analysis.tdf` is SQLite (`DiaFrameMsMsWindows` = DIA windows), ~15 MB inside a
     multi-GB archive (#33).
   - Deposited search outputs beat Methods prose: MaxQuant `summary.txt`/`parameters.txt`,
-    FragPipe `fragger.params`, DIA-NN logs, Proteome Discoverer `.msf` (SQLite), SpectroMine
-    `.psar` (UTF-16 strings). Often the ONLY source of the channel→sample map.
+    FragPipe `fragger.params`, DIA-NN logs, Proteome Discoverer `.msf`/`.pdStudy` (SQLite),
+    SpectroMine `.psar` (UTF-16 strings). Often the ONLY source of the channel→sample map —
+    **and always the authoritative source of the search modifications.** Derive
+    `comment[modification parameters]` from them, never from paper prose or from what the
+    protocol implies: PD's `Workflows` node XML gives `IntendedPurpose` (`StaticModification`
+    → `MT=Fixed`, `DynamicModification` → `MT=Variable`, any `…TerminalModification` → `PP=`
+    not `TA=`) plus `UnimodAccession` and `CleavageReagent`; MaxQuant `mqpar.xml` gives
+    fixed/variable lists; FragPipe `table.fix-mods`/`table.var-mods`; DIA-NN
+    `--fixed-mod`/`--var-mod`. Read multi-GB `.msf` by HTTP-range SQLite — do not download.
+    Read the modifications and the channel map out of the same file in one pass.
 - **`is_open_access` is unreliable** in PRIDE *and* Europe PMC. A gold-OA CC-BY paper was reported
   `false` by both. Always try `get_pdf_by_unpaywall`; also the PMC HTML render, NCBI eutils, and
   Europe PMC free-text search on the accession itself. Unpaywall has returned anti-bot HTML while
@@ -68,8 +76,14 @@ mkdir -p "$CLAUDE_SCRATCH/<PXD>/"      # or <repo>/../scratch/<PXD>/ if no scrat
 - **UNIMOD:1 = Acetyl, UNIMOD:21 = Phospho.** Positional values go in `PP=`, never `TA=`.
   **Dimethyl trap**: OLS returns `UNIMOD:510` for "Dimethyl" — that is `Dimethyl:2H(4)13C(2)` (+6).
   Heavy +8 is **UNIMOD:330**. Derive each channel from the actual stated mass shift.
-  **Never assert Carbamidomethyl without an alkylation step** — many SCP protocols eliminate
-  reduction/alkylation; the reflex annotation is wrong on every row and passes validation.
+  **Carbamidomethyl cuts both ways.** Never assert it when a source explicitly documents that
+  reduction/alkylation was omitted — many SCP protocols eliminate it, and the reflex annotation
+  is wrong on every row and passes validation. Equally, never drop a Carbamidomethyl the
+  deposited search declares `Fixed` just because the wet-lab reagent is unstated (PXD048052:
+  a closed paper + a "no alkylation" assumption lost against the PD `.msf`, which listed
+  `StaticModification` Carbamidomethyl UNIMOD:4). Silence about the prep is not evidence of no
+  alkylation — the search wins, and the unstated reagent is `not available`, NOT
+  `not applicable`.
 - **"Single-cell-equivalent" is a mass, not a count.** `0.5 ng ≈ 2–3 cells` is a dilution standard:
   `sample type = standard`, `cells per well = not applicable` — not 2 or 3.
 - **Column licensing**: every `characteristics[...]` you use MUST be licensed by a template you
@@ -89,10 +103,19 @@ An SDRF needs one row per (file × label channel), each with a sample identity.
 - **Label-free, 1 file = 1 cell** → annotatable.
 - **Multiplexed** (TMT/plexDIA/dimethyl): you MUST find the channel→sample map. Check the paper +
   supplementary, the deposited result tables (Proteome Discoverer defaults every channel to
-  `"Sample, n/a"` = NO map; SpectroMine `.psar` likewise), `files/all` for a sample sheet, and
+  `"Sample, n/a"`, and `StudyInformation.txt` to a bare `"Sample"` with empty groups = NO map;
+  SpectroMine `.psar` likewise), `files/all` for a sample sheet, and
   `https://www.ebi.ac.uk/europepmc/webservices/rest/<PMCID>/supplementaryFiles`.
+  **Then follow the paper's Data Availability / Code Availability links** — Zenodo
+  (`https://zenodo.org/api/records/<id>`), figshare, OSF, Dryad, or the analysis GitHub repo.
+  The layout files (`label_layout`, `sort_layout`, `sample_layout`, `file_sample_mapping`,
+  `annotation.csv`, FACS exports) are deposited there far more often than in PRIDE: PXD053053
+  was a false BLOCK until its Zenodo record (12615623) turned it into 1344 annotatable rows,
+  cross-validated against the deposited `.h5ad` with 0 discrepancies. Reconstruct the map
+  deterministically and cross-check it against a collated result object where one exists.
   Layouts can **flip between runs** — never assume one fixed layout.
-  If no map exists → **BLOCKED**. Do not fabricate channel identities. Write the report +
+  If no map exists → **BLOCKED**, but only after those external sources are exhausted too;
+  name every source checked in the report. Do not fabricate channel identities. Write the report +
   BLOCKED.md entry. A partial annotation (one arm annotatable, another not) is legitimate.
 - Supplementary per-sample tables are gold — but verify they belong to YOUR paper.
 
